@@ -34,6 +34,15 @@ async function withPage<T>(label: string, fn: (page: Page) => Promise<T>, retrie
   }
 }
 
+/** "2026-10-27T07:00" in UK local time, as JustPark's search URL expects */
+function jpTime(iso: string) {
+  if (!/(Z|[+-]\d{2}:?\d{2})$/.test(iso)) return iso.slice(0, 16); // no offset: already local wall-clock time
+  const p = Object.fromEntries(new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/London", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  }).formatToParts(new Date(iso)).map((x) => [x.type, x.value]));
+  return `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}`;
+}
+
 /** Drive the public search UI (no partner API exists for driver bookings). */
 export async function search(intent: Intent) {
   return withPage("search", async (page) => {
@@ -43,12 +52,20 @@ export async function search(intent: Intent) {
     const where = page.getByPlaceholder(/where|search|postcode|destination/i).first();
     await where.fill(intent.destination);
     await page.getByRole("option").first().click({ timeout: 8000 }).catch(() => where.press("Enter"));
-    await page.waitForLoadState("networkidle");
+    // The site routes client-side, so wait for the real results URL rather than reading whatever page is open
+    await page.waitForURL(/\/search\?/, { timeout: 15_000 }).catch(() => {});
 
-    // Times go in the results URL. Param names are env-configurable so you can fix them from Railway, no code change.
-    const url = new URL(page.url());
-    url.searchParams.set(process.env.JP_PARAM_START ?? "arriving", intent.start.slice(0, 16));
-    url.searchParams.set(process.env.JP_PARAM_END ?? "leaving", intent.end.slice(0, 16));
+    // Build the results URL ourselves, e.g. /search?arriving=2026-10-27T07:00&leaving=…&q=…&coords=…&place_id=…
+    // keeping the place details JustPark resolved. Param names are env-configurable from Railway.
+    const found = new URL(page.url());
+    const url = new URL("https://www.justpark.com/search");
+    for (const k of ["q", "coords", "place_id", "filters"]) {
+      const v = found.searchParams.get(k);
+      if (v) url.searchParams.set(k, v);
+    }
+    if (!url.searchParams.has("q")) url.searchParams.set("q", intent.destination);
+    url.searchParams.set(process.env.JP_PARAM_START ?? "arriving", jpTime(intent.start));
+    url.searchParams.set(process.env.JP_PARAM_END ?? "leaving", jpTime(intent.end));
     await page.goto(url.toString(), { waitUntil: "networkidle" });
     const screenshot = await shot(page, "results");
 
