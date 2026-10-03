@@ -19,11 +19,12 @@ export async function parseIntent(prompt: string): Promise<Intent> {
   const now = new Date().toLocaleString("en-GB", { timeZone: "Europe/London", dateStyle: "full", timeStyle: "short" });
   const res = await anthropic.messages.create({
     model: MODEL,
-    max_tokens: 1000,
+    max_tokens: 16000,
     system: `You turn parking requests into a JustPark search. Now: ${now} (Europe/London).
 Resolve relative dates ("Saturday", "tomorrow evening"). If no end time is given, infer a sensible one
 (match: kick-off -1h to final whistle +1h; dinner: 3h; airport: ask nothing, use stated return).
-autoBook=true only if the user explicitly says to just book it.`,
+autoBook=true only if the user explicitly says to just book it.
+Always answer by calling the search_parking tool.`,
     tools: [{
       name: "search_parking",
       description: "Structured JustPark search",
@@ -41,7 +42,8 @@ autoBook=true only if the user explicitly says to just book it.`,
         required: ["destination", "start", "end"],
       },
     }],
-    tool_choice: { type: "tool", name: "search_parking" },
+    // Current models reject forced tool_choice ("tool"/"any"); the system prompt asks for the call instead
+    tool_choice: { type: "auto" },
     messages: [{ role: "user", content: prompt }],
   });
   const call = res.content.find((b) => b.type === "tool_use");
@@ -58,8 +60,8 @@ export type Listing = {
 export async function extractListings(pageText: string, links: { text: string; href: string }[]): Promise<Listing[]> {
   const res = await anthropic.messages.create({
     model: MODEL,
-    max_tokens: 4000,
-    system: "Extract parking listings from a JustPark search results page. Only use URLs from the provided links list. Return via the tool.",
+    max_tokens: 16000,
+    system: "Extract parking listings from a JustPark search results page. Only use URLs from the provided links list. Always answer by calling the listings tool.",
     tools: [{
       name: "listings",
       description: "Parsed listings",
@@ -82,7 +84,7 @@ export async function extractListings(pageText: string, links: { text: string; h
         required: ["items"],
       },
     }],
-    tool_choice: { type: "tool", name: "listings" },
+    tool_choice: { type: "auto" },
     messages: [{
       role: "user",
       content: `PAGE TEXT:\n${pageText.slice(0, 60_000)}\n\nLINKS:\n${JSON.stringify(links.slice(0, 300))}`,
