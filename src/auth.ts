@@ -1,7 +1,7 @@
 // Server-side login so no computer is ever needed.
 // Handles: auto-login with stored credentials, a pause for 2FA codes you send from your phone,
 // and screenshots of every step you can view in Safari.
-import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
+import { chromium, type Browser, type BrowserContext, type Locator, type Page } from "playwright";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -34,9 +34,14 @@ export async function shot(page: Page, label: string) {
   return path.basename(file);
 }
 
+// isVisible() ignores its timeout and checks once — this actually waits
+const visible = (l: Locator, timeout: number) => l.waitFor({ state: "visible", timeout }).then(() => true, () => false);
+
 export async function dismissCookies(page: Page) {
-  const btn = page.getByRole("button", { name: /only necessary|accept all|accept|agree|got it/i }).first();
-  if (await btn.isVisible({ timeout: 8000 }).catch(() => false)) {
+  // JustPark's banner is Ethyca Fides; fall back to generic button text
+  const btn = page.locator(".fides-reject-all-button, .fides-accept-all-button")
+    .or(page.getByRole("button", { name: /only necessary|accept all|accept|agree|got it/i })).first();
+  if (await visible(btn, 8000)) {
     await btn.click().catch(() => {});
     await page.waitForTimeout(600);
   }
@@ -47,7 +52,7 @@ const onLoginPage = async (page: Page) =>
 
 const captcha = (page: Page) =>
   page.locator("iframe[src*='recaptcha'], iframe[src*='hcaptcha'], iframe[src*='turnstile'], text=/verify you are human/i")
-    .first().isVisible({ timeout: 2000 }).catch(() => false);
+    .first().isVisible().catch(() => false);
 
 const codeInput = (page: Page) =>
   page.locator("input[autocomplete='one-time-code'], input[name*='code' i], input[id*='code' i], input[inputmode='numeric']").first();
@@ -95,14 +100,14 @@ export async function login() {
     await dismissCookies(page);
 
     const emailChoice = page.getByText(/log ?in with email|sign ?in with email|continue with email/i).first();
-    if (await emailChoice.isVisible({ timeout: 6000 }).catch(() => false)) {
+    if (await visible(emailChoice, 10_000)) {
       await emailChoice.click();
       await page.waitForTimeout(800);
     }
     const emailInput = page.locator("input[type=email], input[name*='email' i]").first();
     await emailInput.fill(email, { timeout: 15_000 });
     const pw = page.locator("input[type=password]").first();
-    if (!(await pw.isVisible({ timeout: 1500 }).catch(() => false))) {
+    if (!(await visible(pw, 1500))) {
       // two-step form: email first, then password
       await emailInput.press("Enter");
     }
@@ -112,6 +117,7 @@ export async function login() {
     if (await submit.isVisible().catch(() => false)) await submit.click();
     else await pw.press("Enter");
     await page.waitForLoadState("networkidle").catch(() => {});
+    await shot(page, "login-submitted");
 
     if (await captcha(page)) {
       const s = await shot(page, "captcha");
@@ -119,7 +125,7 @@ export async function login() {
       throw new SessionError("blocked", `JustPark showed a CAPTCHA (screenshot ${s}). Wait an hour and try again.`);
     }
 
-    if (await codeInput(page).isVisible({ timeout: 4000 }).catch(() => false)) {
+    if (await visible(codeInput(page), 4000)) {
       const s = await shot(page, "needs-code");
       pending = { browser, ctx, page, timer: setTimeout(clearPending, 10 * 60_000) };
       return { status: "needs_code" as const, screenshot: s };
