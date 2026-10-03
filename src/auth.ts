@@ -50,9 +50,10 @@ export async function dismissCookies(page: Page) {
 const onLoginPage = async (page: Page) =>
   /login|sign-?in/i.test(page.url()) || (await page.locator("input[type=password]").isVisible().catch(() => false));
 
-const captcha = (page: Page) =>
-  page.locator("iframe[src*='recaptcha'], iframe[src*='hcaptcha'], iframe[src*='turnstile'], text=/verify you are human/i")
-    .first().isVisible().catch(() => false);
+// The challenge itself, not the always-present reCAPTCHA badge
+const captchaShown = (page: Page, timeout: number) =>
+  visible(page.locator("iframe[src*='recaptcha'][src*='bframe'], iframe[src*='hcaptcha'][src*='challenge'], iframe[src*='challenges.cloudflare.com']")
+    .or(page.getByText(/verify you are human/i)).filter({ visible: true }).first(), timeout);
 
 const codeInput = (page: Page) =>
   page.locator("input[autocomplete='one-time-code'], input[name*='code' i], input[id*='code' i], input[inputmode='numeric']").first();
@@ -69,7 +70,7 @@ export async function checkSession(): Promise<{ loggedIn: boolean; screenshot: s
   } finally { await browser.close(); }
 }
 
-// A login paused waiting for your 2FA code
+// A login paused waiting for you: a 2FA code, or a CAPTCHA you solve by tapping a live view
 let pending: { browser: Browser; ctx: BrowserContext; page: Page; timer: NodeJS.Timeout } | null = null;
 const clearPending = async () => {
   if (!pending) return;
@@ -77,6 +78,18 @@ const clearPending = async () => {
   await pending.browser.close().catch(() => {});
   pending = null;
 };
+const hold = (browser: Browser, ctx: BrowserContext, page: Page) => {
+  if (pending) clearTimeout(pending.timer);
+  pending = { browser, ctx, page, timer: setTimeout(clearPending, 10 * 60_000) };
+};
+
+async function submitForm(page: Page) {
+  // Submit via the form itself — button-name matching can hit "Continue with Google/Apple" first
+  const submit = page.locator("form:has(input[type=password]) button[type=submit]").first();
+  if (await submit.isVisible().catch(() => false)) await submit.click();
+  else await page.locator("input[type=password]").first().press("Enter");
+  await page.waitForLoadState("networkidle").catch(() => {});
+}
 
 async function finish(page: Page, ctx: BrowserContext) {
   await page.waitForLoadState("networkidle").catch(() => {});
@@ -112,22 +125,18 @@ export async function login() {
       await emailInput.press("Enter");
     }
     await pw.fill(password);
-    // Submit via the form itself — button-name matching can hit "Continue with Google/Apple" first
-    const submit = page.locator("form:has(input[type=password]) button[type=submit]").first();
-    if (await submit.isVisible().catch(() => false)) await submit.click();
-    else await pw.press("Enter");
-    await page.waitForLoadState("networkidle").catch(() => {});
+    await submitForm(page);
     await shot(page, "login-submitted");
 
-    if (await captcha(page)) {
-      const s = await shot(page, "captcha");
-      await browser.close();
-      throw new SessionError("blocked", `JustPark showed a CAPTCHA (screenshot ${s}). Wait an hour and try again.`);
+    if (await captchaShown(page, 6000)) {
+      const s = await shot(page, "needs-captcha");
+      hold(browser, ctx, page);
+      return { status: "needs_captcha" as const, screenshot: s };
     }
 
     if (await visible(codeInput(page), 4000)) {
       const s = await shot(page, "needs-code");
-      pending = { browser, ctx, page, timer: setTimeout(clearPending, 10 * 60_000) };
+      hold(browser, ctx, page);
       return { status: "needs_code" as const, screenshot: s };
     }
 
@@ -151,4 +160,39 @@ export async function submitCode(code: string) {
     await page.getByRole("button", { name: /verify|confirm|continue|submit|log ?in/i }).first().click().catch(() => page.keyboard.press("Enter"));
     return await finish(page, ctx);
   } finally { await clearPending(); }
+}
+
+const needPending = () => {
+  if (!pending) throw new SessionError("failed", "No login is waiting (they expire after 10 min). Tap Log in again.");
+  return pending;
+};
+
+/** What the paused login's browser is showing right now (1280×900, coordinates match tap()) */
+export async function liveScreen() {
+  return needPending().page.screenshot({ type: "jpeg", quality: 70 });
+}
+
+/** Click the paused login's page at a point on the liveScreen() image */
+export async function tap(x: number, y: number) {
+  const p = needPending();
+  hold(p.browser, p.ctx, p.page); // each tap restarts the 10-minute timer
+  await p.page.mouse.click(x, y);
+  await p.page.waitForTimeout(800);
+}
+
+/** After you've solved the CAPTCHA: carry on with the login */
+export async function continueLogin() {
+  const { ctx, page } = needPending();
+  await page.waitForLoadState("networkidle").catch(() => {});
+  if (await captchaShown(page, 1500)) return { status: "needs_captcha" as const, screenshot: await shot(page, "needs-captcha") };
+  if (await visible(codeInput(page), 2000)) return { status: "needs_code" as const, screenshot: await shot(page, "needs-code") };
+
+  // Solving usually submits the form; if we're still on it, submit again
+  if (await page.locator("input[type=password]").first().isVisible().catch(() => false)) {
+    await submitForm(page);
+    if (await captchaShown(page, 4000)) return { status: "needs_captcha" as const, screenshot: await shot(page, "needs-captcha") };
+    if (await visible(codeInput(page), 3000)) return { status: "needs_code" as const, screenshot: await shot(page, "needs-code") };
+  }
+  try { return await finish(page, ctx); }
+  finally { await clearPending(); }
 }

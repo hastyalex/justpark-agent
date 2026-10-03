@@ -2,7 +2,7 @@ import express from "express";
 import fs from "node:fs";
 import path from "node:path";
 import { plan, confirm } from "./agent.js";
-import { SHOTS_DIR, SessionError, checkSession, login, submitCode } from "./auth.js";
+import { SHOTS_DIR, SessionError, checkSession, continueLogin, liveScreen, login, submitCode, tap } from "./auth.js";
 import { consoleHtml } from "./console.js";
 
 const app = express();
@@ -32,11 +32,29 @@ app.get("/", (_, res) => res.type("html").send(consoleHtml));
 
 // Setup + login
 app.post("/session/check", run(() => checkSession()));
+const loginMessage = (status: string) =>
+  status === "needs_code" ? "JustPark sent you a code — type it in the box and tap Send code."
+  : status === "needs_captcha" ? "JustPark wants a CAPTCHA. Tap the right pictures below, tap Verify, then tap Done."
+  : "✅ Logged in.";
 app.post("/session/login", run(async () => {
   const r = await login();
-  return { ...r, message: r.status === "needs_code" ? "JustPark sent you a code — send it to /session/code." : "✅ Logged in." };
+  return { ...r, message: loginMessage(r.status) };
 }));
 app.post("/session/code", run(async (req) => ({ ...(await submitCode(String(req.body.code))), message: "✅ Logged in." })));
+
+// Solving a CAPTCHA from your phone: view the paused browser, tap it, then continue
+app.get("/session/screen", async (_, res) => {
+  try { res.type("jpeg").send(await liveScreen()); }
+  catch (e: any) { res.status(404).send(e.message); }
+});
+app.post("/session/tap", async (req, res) => {
+  try { await tap(Number(req.body.x), Number(req.body.y)); res.json({ ok: true }); }
+  catch (e: any) { res.status(404).json({ message: `⚠️ ${e.message}` }); }
+});
+app.post("/session/continue", run(async () => {
+  const r = await continueLogin();
+  return { ...r, message: loginMessage(r.status) };
+}));
 
 // Booking
 app.post("/plan", run((req) => plan(req.body.prompt)));

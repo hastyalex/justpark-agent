@@ -22,6 +22,12 @@ img{max-width:100%;border-radius:12px;margin-top:8px;border:1px solid #8884}
 <button class="alt" onclick="go('/session/login')">Log in</button>
 <input id="code" inputmode="numeric" autocomplete="one-time-code" placeholder="Verification code" style="margin-top:8px">
 <button class="alt" onclick="go('/session/code',{code:code.value})">Send code</button>
+<div id="cap" hidden>
+<h2>Solve the CAPTCHA</h2>
+<p style="color:var(--mut);margin:0">This is JustPark's page, live. Tap it like you normally would — the pictures, then Verify. Then tap Done.</p>
+<img id="live" style="cursor:pointer">
+<button onclick="go('/session/continue')">Done</button><button class="alt" onclick="loadLive()">Refresh</button>
+</div>
 <h2>Latest screenshot</h2>
 <button class="alt" onclick="loadShot()">Refresh</button><img id="shot">
 <script>
@@ -29,8 +35,13 @@ const T=new URLSearchParams(location.search).get('token');let planId=null;
 async function go(path,body){out.textContent='Working… (searches take ~30–60s)';opts.innerHTML='';
  try{const r=await fetch(path+'?token='+T,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
  const j=await r.json();out.textContent=j.message||JSON.stringify(j,null,2);
+ cap.hidden=j.status!=='needs_captcha';if(!cap.hidden){loadLive();cap.scrollIntoView()}
  if(j.planId){planId=j.planId;j.options.forEach(o=>{const b=document.createElement('button');b.textContent='Book '+o.id+' · £'+o.priceGbp.toFixed(2);b.onclick=()=>go('/book',{planId,option:o.id});opts.appendChild(b)})}}
  catch(e){out.textContent='⚠️ '+e.message}loadShot()}
+function loadLive(){live.src='/session/screen?token='+T+'&t='+Date.now()}
+live.onclick=async e=>{const x=Math.round(e.offsetX*live.naturalWidth/live.clientWidth),y=Math.round(e.offsetY*live.naturalHeight/live.clientHeight);
+ live.style.opacity=.5;await fetch('/session/tap?token='+T,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({x,y})}).catch(()=>{});
+ live.style.opacity=1;loadLive()};
 function loadShot(){shot.src='/shots/latest?token='+T+'&t='+Date.now()}
 loadShot();
 </script></body></html>`;
