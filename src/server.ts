@@ -48,6 +48,11 @@ app.get("/shots/latest", (_, res) => {
   const f = fs.readdirSync(SHOTS_DIR).sort().pop();
   f ? res.sendFile(path.resolve(SHOTS_DIR, f)) : res.status(404).send("No screenshots yet");
 });
+// Newest screenshot for a step, e.g. /shots/latest/login-submitted
+app.get("/shots/latest/:label", (req, res) => {
+  const f = fs.readdirSync(SHOTS_DIR).filter((n) => n.endsWith(`-${req.params.label}.png`)).sort().pop();
+  f ? res.sendFile(path.resolve(SHOTS_DIR, f)) : res.status(404).send(`No "${req.params.label}" screenshot yet`);
+});
 app.get("/shots/:file", (req, res) => res.sendFile(path.resolve(SHOTS_DIR, path.basename(req.params.file))));
 
 app.listen(Number(process.env.PORT ?? 3000), () => console.log("JustPark agent up"));
