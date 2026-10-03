@@ -1,7 +1,7 @@
 import type { Page } from "playwright";
 import fs from "node:fs";
 import type { Intent, Listing } from "./intent.js";
-import { AUTH_FILE, SessionError, dismissCookies, launch, login, newContext, shot } from "./auth.js";
+import { AUTH_FILE, SessionError, dismissCookies, launch, login, newContext, shot, visible } from "./auth.js";
 
 async function ensureSession() {
   if (fs.existsSync(AUTH_FILE)) return;
@@ -51,9 +51,17 @@ export async function search(intent: Intent) {
 
     const where = page.getByPlaceholder(/where|search|postcode|destination/i).first();
     await where.fill(intent.destination);
-    await page.getByRole("option").first().click({ timeout: 8000 }).catch(() => where.press("Enter"));
-    // The site routes client-side, so wait for the real results URL rather than reading whatever page is open
-    await page.waitForURL(/\/search\?/, { timeout: 15_000 }).catch(() => {});
+    const option = page.getByRole("option").first();
+    if (await visible(option, 8000)) await option.click();
+    else await where.press("Enter");
+    // The site routes client-side, so wait for the real results URL (it carries coords + place_id)
+    const onResults = () => page.waitForURL(/\/search\?/, { timeout: 8000 }).then(() => true, () => false);
+    if (!(await onResults())) {
+      // Picking a suggestion only filled the box; submit the search
+      const go = page.getByRole("button", { name: /search|find parking|^go$/i }).first();
+      if (await visible(go, 2000)) await go.click(); else await where.press("Enter");
+      await onResults();
+    }
 
     // Build the results URL ourselves, e.g. /search?arriving=2026-10-27T07:00&leaving=…&q=…&coords=…&place_id=…
     // keeping the place details JustPark resolved. Param names are env-configurable from Railway.
@@ -66,7 +74,10 @@ export async function search(intent: Intent) {
     if (!url.searchParams.has("q")) url.searchParams.set("q", intent.destination);
     url.searchParams.set(process.env.JP_PARAM_START ?? "arriving", jpTime(intent.start));
     url.searchParams.set(process.env.JP_PARAM_END ?? "leaving", jpTime(intent.end));
-    await page.goto(url.toString(), { waitUntil: "networkidle" });
+    // The results page has a live map and never goes network-idle; wait for prices instead
+    await page.goto(url.toString(), { waitUntil: "domcontentloaded" });
+    await page.getByText(/£\s?\d/).first().waitFor({ timeout: 20_000 }).catch(() => {});
+    await page.waitForTimeout(1500);
     const screenshot = await shot(page, "results");
 
     const text = await page.locator("body").innerText();
@@ -79,11 +90,13 @@ export async function search(intent: Intent) {
 
 export async function book(listing: Listing, _intent: Intent, opts: { dryRun: boolean }) {
   return withPage("book", async (page) => {
-    await page.goto(listing.url, { waitUntil: "networkidle" });
+    await page.goto(listing.url, { waitUntil: "domcontentloaded" });
+    await page.waitForLoadState("load").catch(() => {});
     await dismissCookies(page);
 
     await page.getByRole("button", { name: /^(book|reserve|book now|continue)/i }).first().click();
-    await page.waitForLoadState("networkidle");
+    await page.waitForLoadState("load").catch(() => {});
+    await page.waitForTimeout(2000);
 
     const body = await page.locator("body").innerText();
     const total = Number((body.match(/total[^£]*£\s?(\d+(?:\.\d{2})?)/i) ?? [])[1]);
@@ -91,15 +104,14 @@ export async function book(listing: Listing, _intent: Intent, opts: { dryRun: bo
     if (total > listing.priceGbp * 1.1 + 0.5) throw new Error(`Price changed: £${total} vs £${listing.priceGbp} quoted.`);
 
     const vehicle = page.getByRole("radio").first();
-    if (await vehicle.isVisible({ timeout: 1500 }).catch(() => false)) await vehicle.check().catch(() => {});
+    if (await visible(vehicle, 1500)) await vehicle.check().catch(() => {});
 
     const screenshot = await shot(page, "checkout");
     if (opts.dryRun) return { status: "dry_run" as const, total, screenshot };
 
     await page.getByRole("button", { name: /^(pay|confirm|complete|book) .*|^pay$|^confirm booking$/i }).last().click();
 
-    const challenged = await page.frameLocator("iframe[src*='3ds'], iframe[name*='challenge']").locator("body")
-      .isVisible({ timeout: 5000 }).catch(() => false);
+    const challenged = await visible(page.frameLocator("iframe[src*='3ds'], iframe[name*='challenge']").locator("body"), 5000);
     if (challenged) return { status: "needs_3ds" as const, total, url: page.url(), screenshot: await shot(page, "3ds") };
 
     await page.getByText(/booking (confirmed|reference)|you're booked|confirmed/i).first().waitFor({ timeout: 30_000 });

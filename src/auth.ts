@@ -35,7 +35,7 @@ export async function shot(page: Page, label: string) {
 }
 
 // isVisible() ignores its timeout and checks once — this actually waits
-const visible = (l: Locator, timeout: number) => l.waitFor({ state: "visible", timeout }).then(() => true, () => false);
+export const visible = (l: Locator, timeout: number) => l.waitFor({ state: "visible", timeout }).then(() => true, () => false);
 
 export async function dismissCookies(page: Page) {
   // JustPark's banner is Ethyca Fides; fall back to generic button text
