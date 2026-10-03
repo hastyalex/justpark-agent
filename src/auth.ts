@@ -99,14 +99,18 @@ export async function login() {
       await emailChoice.click();
       await page.waitForTimeout(800);
     }
-    await page.locator("input[type=email], input[name*='email' i]").first().fill(email, { timeout: 15_000 });
+    const emailInput = page.locator("input[type=email], input[name*='email' i]").first();
+    await emailInput.fill(email, { timeout: 15_000 });
     const pw = page.locator("input[type=password]").first();
     if (!(await pw.isVisible({ timeout: 1500 }).catch(() => false))) {
       // two-step form: email first, then password
-      await page.getByRole("button", { name: /continue|next/i }).first().click();
+      await emailInput.press("Enter");
     }
     await pw.fill(password);
-    await page.getByRole("button", { name: /log ?in|sign ?in|continue/i }).first().click();
+    // Submit via the form itself — button-name matching can hit "Continue with Google/Apple" first
+    const submit = page.locator("form:has(input[type=password]) button[type=submit]").first();
+    if (await submit.isVisible().catch(() => false)) await submit.click();
+    else await pw.press("Enter");
     await page.waitForLoadState("networkidle").catch(() => {});
 
     if (await captcha(page)) {
