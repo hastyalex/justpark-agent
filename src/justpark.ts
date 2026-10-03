@@ -43,25 +43,40 @@ function jpTime(iso: string) {
   return `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}`;
 }
 
+/** "lat,lng" for a UK place via OpenStreetMap (fallback when JustPark's dropdown doesn't resolve it) */
+async function geocode(place: string): Promise<string | null> {
+  const u = new URL("https://nominatim.openstreetmap.org/search");
+  u.search = new URLSearchParams({ q: place, format: "json", limit: "1", countrycodes: "gb" }).toString();
+  const res = await fetch(u, { headers: { "User-Agent": "justpark-agent (personal use)" } }).catch(() => null);
+  const [hit] = res?.ok ? ((await res.json()) as { lat: string; lon: string }[]) : [];
+  return hit ? `${hit.lat},${hit.lon}` : null;
+}
+
 /** Drive the public search UI (no partner API exists for driver bookings). */
 export async function search(intent: Intent) {
   return withPage("search", async (page) => {
     await page.goto("https://www.justpark.com/", { waitUntil: "domcontentloaded" });
     await dismissCookies(page);
 
+    // Type like a person so JustPark's location dropdown appears, then pick the top suggestion.
+    // Picking it is what pins the location (coords + place_id); free text alone searches London.
     const where = page.getByPlaceholder(/where|search|postcode|destination/i).first();
-    await where.fill(intent.destination);
-    const option = page.getByRole("option").first();
-    if (await visible(option, 8000)) await option.click();
-    else await where.press("Enter");
+    await where.click();
+    await where.fill("");
+    await where.pressSequentially(intent.destination, { delay: 60 });
+    const suggestion = page.locator("[role=option], [role=listbox] li, .pac-item, [data-testid*=suggestion i], [class*=suggestion i] li")
+      .filter({ visible: true }).first();
+    if (await visible(suggestion, 8000)) await suggestion.click();
+    else { await where.press("ArrowDown"); await where.press("Enter"); }
     // The site routes client-side, so wait for the real results URL (it carries coords + place_id)
-    const onResults = () => page.waitForURL(/\/search\?/, { timeout: 8000 }).then(() => true, () => false);
+    const onResults = () => page.waitForURL(/\/search\?.*coords=/, { timeout: 8000 }).then(() => true, () => false);
     if (!(await onResults())) {
       // Picking a suggestion only filled the box; submit the search
       const go = page.getByRole("button", { name: /search|find parking|^go$/i }).first();
       if (await visible(go, 2000)) await go.click(); else await where.press("Enter");
       await onResults();
     }
+    await shot(page, "location-picked");
 
     // Build the results URL ourselves, e.g. /search?arriving=2026-10-27T07:00&leaving=…&q=…&coords=…&place_id=…
     // keeping the place details JustPark resolved. Param names are env-configurable from Railway.
@@ -70,6 +85,13 @@ export async function search(intent: Intent) {
     for (const k of ["q", "coords", "place_id", "filters"]) {
       const v = found.searchParams.get(k);
       if (v) url.searchParams.set(k, v);
+    }
+    if (!url.searchParams.has("coords")) {
+      // The dropdown didn't pin a location; look it up ourselves rather than let JustPark default to London
+      const coords = await geocode(intent.destination);
+      if (!coords) throw new Error(`Couldn't find "${intent.destination}" — try adding a town or postcode.`);
+      url.searchParams.set("coords", coords);
+      url.searchParams.delete("place_id");
     }
     if (!url.searchParams.has("q")) url.searchParams.set("q", intent.destination);
     url.searchParams.set(process.env.JP_PARAM_START ?? "arriving", jpTime(intent.start));
