@@ -35,8 +35,11 @@ export async function shot(page: Page, label: string) {
 }
 
 export async function dismissCookies(page: Page) {
-  const btn = page.getByRole("button", { name: /accept( all)?|agree|got it/i }).first();
-  if (await btn.isVisible({ timeout: 3000 }).catch(() => false)) await btn.click();
+  const btn = page.getByRole("button", { name: /only necessary|accept all|accept|agree|got it/i }).first();
+  if (await btn.isVisible({ timeout: 8000 }).catch(() => false)) {
+    await btn.click().catch(() => {});
+    await page.waitForTimeout(600);
+  }
 }
 
 const onLoginPage = async (page: Page) =>
@@ -91,7 +94,12 @@ export async function login() {
     await page.goto(LOGIN_URL, { waitUntil: "networkidle" });
     await dismissCookies(page);
 
-    await page.locator("input[type=email], input[name*='email' i]").first().fill(email);
+    const emailChoice = page.getByText(/log ?in with email|sign ?in with email|continue with email/i).first();
+    if (await emailChoice.isVisible({ timeout: 6000 }).catch(() => false)) {
+      await emailChoice.click();
+      await page.waitForTimeout(800);
+    }
+    await page.locator("input[type=email], input[name*='email' i]").first().fill(email, { timeout: 15_000 });
     const pw = page.locator("input[type=password]").first();
     if (!(await pw.isVisible({ timeout: 1500 }).catch(() => false))) {
       // two-step form: email first, then password
@@ -117,7 +125,10 @@ export async function login() {
     await browser.close();
     return result;
   } catch (e) {
-    if (!pending) await browser.close().catch(() => {});
+    if (!pending) {
+      await shot(page, "login-error");
+      await browser.close().catch(() => {});
+    }
     throw e;
   }
 }
