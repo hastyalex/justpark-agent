@@ -1,13 +1,14 @@
 // Server-side login so no computer is ever needed.
 // Handles: auto-login with stored credentials, a pause for 2FA codes you send from your phone,
 // and screenshots of every step you can view in Safari.
-import { chromium, type Browser, type BrowserContext, type Locator, type Page } from "playwright";
+import { chromium, type BrowserContext, type Locator, type Page } from "playwright";
 import fs from "node:fs";
 import path from "node:path";
 
 export const DATA_DIR = process.env.DATA_DIR ?? "./data"; // mount a Railway volume here
 export const SHOTS_DIR = path.join(DATA_DIR, "shots");
-export const AUTH_FILE = path.join(DATA_DIR, "auth.json");
+const AUTH_FILE = path.join(DATA_DIR, "auth.json"); // cookies saved by older versions, used once to seed the profile
+const PROFILE_DIR = path.join(DATA_DIR, "profile");
 fs.mkdirSync(SHOTS_DIR, { recursive: true });
 
 const LOGIN_URL = process.env.JP_LOGIN_URL ?? "https://www.justpark.com/login";
@@ -18,13 +19,28 @@ export class SessionError extends Error {
   constructor(public status: "needs_code" | "blocked" | "failed", message: string) { super(message); }
 }
 
-export const launch = () => chromium.launch({ headless: true, args: ["--disable-blink-features=AutomationControlled"] });
-
-export const newContext = (browser: Browser, withSession = true) =>
-  browser.newContext({
-    storageState: withSession && fs.existsSync(AUTH_FILE) ? AUTH_FILE : undefined,
+/**
+ * One browser profile kept on the volume, like your own Safari: cookies, storage and cache survive between runs,
+ * so JustPark keeps you logged in and the app rarely has to log in again (logins are where CAPTCHAs appear).
+ * Only one can be open at a time; the server already runs one job at a time.
+ */
+export async function openProfile(): Promise<BrowserContext> {
+  if (pending) throw new SessionError("failed", "A login is waiting for you (CAPTCHA or code). Finish it on the control page, or wait 10 min.");
+  const fresh = !fs.existsSync(PROFILE_DIR);
+  // Clear lock files left by a crash or a redeploy onto a new machine; we never open the profile twice
+  for (const f of ["SingletonLock", "SingletonCookie", "SingletonSocket"]) fs.rmSync(path.join(PROFILE_DIR, f), { force: true });
+  const ctx = await chromium.launchPersistentContext(PROFILE_DIR, {
+    headless: true, args: ["--disable-blink-features=AutomationControlled"],
     locale: "en-GB", timezoneId: "Europe/London", userAgent: UA, viewport: { width: 1280, height: 900 },
   });
+  if (fresh && fs.existsSync(AUTH_FILE)) {
+    const { cookies } = JSON.parse(fs.readFileSync(AUTH_FILE, "utf8"));
+    await ctx.addCookies(cookies).catch(() => {});
+  }
+  return ctx;
+}
+
+const firstPage = async (ctx: BrowserContext) => ctx.pages()[0] ?? ctx.newPage();
 
 export async function shot(page: Page, label: string) {
   const file = path.join(SHOTS_DIR, `${Date.now()}-${label}.png`);
@@ -60,27 +76,27 @@ const codeInput = (page: Page) =>
 
 /** Is the saved session still good? */
 export async function checkSession(): Promise<{ loggedIn: boolean; screenshot: string }> {
-  const browser = await launch();
+  const ctx = await openProfile();
   try {
-    const ctx = await newContext(browser);
-    const page = await ctx.newPage();
+    const page = await firstPage(ctx);
     await page.goto(ACCOUNT_URL, { waitUntil: "networkidle" });
     await dismissCookies(page);
     return { loggedIn: !(await onLoginPage(page)), screenshot: await shot(page, "session-check") };
-  } finally { await browser.close(); }
+  } finally { await ctx.close(); }
 }
 
 // A login paused waiting for you: a 2FA code, or a CAPTCHA you solve by tapping a live view
-let pending: { browser: Browser; ctx: BrowserContext; page: Page; timer: NodeJS.Timeout } | null = null;
+let pending: { ctx: BrowserContext; page: Page; timer: NodeJS.Timeout } | null = null;
 const clearPending = async () => {
   if (!pending) return;
   clearTimeout(pending.timer);
-  await pending.browser.close().catch(() => {});
+  const { ctx } = pending;
   pending = null;
+  await ctx.close().catch(() => {});
 };
-const hold = (browser: Browser, ctx: BrowserContext, page: Page) => {
+const hold = (ctx: BrowserContext, page: Page) => {
   if (pending) clearTimeout(pending.timer);
-  pending = { browser, ctx, page, timer: setTimeout(clearPending, 10 * 60_000) };
+  pending = { ctx, page, timer: setTimeout(clearPending, 10 * 60_000) };
 };
 
 async function submitForm(page: Page) {
@@ -91,12 +107,11 @@ async function submitForm(page: Page) {
   await page.waitForLoadState("networkidle").catch(() => {});
 }
 
-async function finish(page: Page, ctx: BrowserContext) {
+async function finish(page: Page) {
   await page.waitForLoadState("networkidle").catch(() => {});
   await page.goto(ACCOUNT_URL, { waitUntil: "networkidle" });
   const s = await shot(page, "after-login");
   if (await onLoginPage(page)) throw new SessionError("failed", `Login didn't stick — see screenshot ${s}`);
-  await ctx.storageState({ path: AUTH_FILE });
   return { status: "ok" as const, screenshot: s };
 }
 
@@ -105,10 +120,16 @@ export async function login() {
   if (!email || !password) throw new SessionError("failed", "Set JUSTPARK_EMAIL and JUSTPARK_PASSWORD in Railway.");
   await clearPending();
 
-  const browser = await launch();
-  const ctx = await newContext(browser, false);
-  const page = await ctx.newPage();
+  const ctx = await openProfile();
+  const page = await firstPage(ctx);
   try {
+    // The profile may still be logged in; don't log in again if so
+    await page.goto(ACCOUNT_URL, { waitUntil: "networkidle" });
+    if (!(await onLoginPage(page))) {
+      const s = await shot(page, "already-logged-in");
+      await ctx.close();
+      return { status: "ok" as const, screenshot: s };
+    }
     await page.goto(LOGIN_URL, { waitUntil: "networkidle" });
     await dismissCookies(page);
 
@@ -130,23 +151,23 @@ export async function login() {
 
     if (await captchaShown(page, 6000)) {
       const s = await shot(page, "needs-captcha");
-      hold(browser, ctx, page);
+      hold(ctx, page);
       return { status: "needs_captcha" as const, screenshot: s };
     }
 
     if (await visible(codeInput(page), 4000)) {
       const s = await shot(page, "needs-code");
-      hold(browser, ctx, page);
+      hold(ctx, page);
       return { status: "needs_code" as const, screenshot: s };
     }
 
-    const result = await finish(page, ctx);
-    await browser.close();
+    const result = await finish(page);
+    await ctx.close();
     return result;
   } catch (e) {
     if (!pending) {
       await shot(page, "login-error");
-      await browser.close().catch(() => {});
+      await ctx.close().catch(() => {});
     }
     throw e;
   }
@@ -154,11 +175,11 @@ export async function login() {
 
 export async function submitCode(code: string) {
   if (!pending) throw new SessionError("failed", "No login is waiting for a code (they expire after 10 min). Run the login again.");
-  const { page, ctx } = pending;
+  const { page } = pending;
   try {
     await codeInput(page).fill(code.trim());
     await page.getByRole("button", { name: /verify|confirm|continue|submit|log ?in/i }).first().click().catch(() => page.keyboard.press("Enter"));
-    return await finish(page, ctx);
+    return await finish(page);
   } finally { await clearPending(); }
 }
 
@@ -175,14 +196,14 @@ export async function liveScreen() {
 /** Click the paused login's page at a point on the liveScreen() image */
 export async function tap(x: number, y: number) {
   const p = needPending();
-  hold(p.browser, p.ctx, p.page); // each tap restarts the 10-minute timer
+  hold(p.ctx, p.page); // each tap restarts the 10-minute timer
   await p.page.mouse.click(x, y);
   await p.page.waitForTimeout(800);
 }
 
 /** After you've solved the CAPTCHA: carry on with the login */
 export async function continueLogin() {
-  const { ctx, page } = needPending();
+  const { page } = needPending();
   await page.waitForLoadState("networkidle").catch(() => {});
   if (await captchaShown(page, 1500)) return { status: "needs_captcha" as const, screenshot: await shot(page, "needs-captcha") };
   if (await visible(codeInput(page), 2000)) return { status: "needs_code" as const, screenshot: await shot(page, "needs-code") };
@@ -193,6 +214,6 @@ export async function continueLogin() {
     if (await captchaShown(page, 4000)) return { status: "needs_captcha" as const, screenshot: await shot(page, "needs-captcha") };
     if (await visible(codeInput(page), 3000)) return { status: "needs_code" as const, screenshot: await shot(page, "needs-code") };
   }
-  try { return await finish(page, ctx); }
+  try { return await finish(page); }
   finally { await clearPending(); }
 }

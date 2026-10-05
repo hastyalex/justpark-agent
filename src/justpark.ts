@@ -1,36 +1,25 @@
 import type { Page } from "playwright";
-import fs from "node:fs";
 import type { Intent, Listing } from "./intent.js";
-import { AUTH_FILE, SessionError, dismissCookies, launch, login, newContext, shot, visible } from "./auth.js";
+import { SessionError, dismissCookies, openProfile, shot, visible } from "./auth.js";
 
-async function ensureSession() {
-  if (fs.existsSync(AUTH_FILE)) return;
-  const r = await login();
-  if (r.status === "needs_code") throw new SessionError("needs_code", "JustPark sent you a verification code — send it to me to finish logging in.");
-}
-
-/** Runs fn with a logged-in page. If JustPark bounced us to login mid-flow, re-login once and retry. */
-async function withPage<T>(label: string, fn: (page: Page) => Promise<T>, retried = false): Promise<T> {
-  await ensureSession();
-  const browser = await launch();
-  const ctx = await newContext(browser);
-  const page = await ctx.newPage();
+/**
+ * Runs fn in the saved browser profile. If JustPark has logged us out, stop and ask you to log in from the
+ * control page rather than logging in automatically — every extra login is another chance of a CAPTCHA.
+ */
+async function withPage<T>(label: string, fn: (page: Page) => Promise<T>): Promise<T> {
+  const ctx = await openProfile();
+  const page = ctx.pages()[0] ?? await ctx.newPage();
   try {
-    const out = await fn(page);
-    await ctx.storageState({ path: AUTH_FILE }).catch(() => {}); // keep cookies fresh
-    return out;
+    return await fn(page);
   } catch (e) {
     const s = await shot(page, `error-${label}`);
-    const bounced = /login|sign-?in/i.test(page.url());
-    await browser.close();
-    if (bounced && !retried) {
-      fs.rmSync(AUTH_FILE, { force: true });
-      return withPage(label, fn, true);
+    if (/login|sign-?in/i.test(page.url())) {
+      throw new SessionError("failed", `JustPark has logged the app out. Tap Log in, then try again. (screenshot ${s})`);
     }
     if (e instanceof SessionError) throw e;
     throw new Error(`${(e as Error).message} (screenshot ${s})`);
   } finally {
-    await browser.close().catch(() => {});
+    await ctx.close().catch(() => {});
   }
 }
 
